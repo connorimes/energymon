@@ -1,8 +1,7 @@
 /**
 * Energy reading from a Watts Up? Power Meter.
 * Written for communications protocol serial data format 1.8.
-* See:
-* https://www.wattsupmeters.com/secure/downloads/CommunicationsProtocol090824.pdf
+* See: ./etc/CommunicationsProtocol090824.pdf
 *
 * @author Connor Imes
 * @date 2016-02-08
@@ -26,12 +25,6 @@ int energymon_get_default(energymon* em) {
 }
 #endif
 
-// Environment variable to enable updating energy estimates b/w device reads.
-// This can provide faster energy data, but risks the total energy being more
-// inaccurate in the long run.
-// Keeping this as an undocumented feature for now.
-#define ENERGYMON_WATTSUP_ENABLE_ESTIMATES "ENERGYMON_WATTSUP_ENABLE_ESTIMATES"
-
 // WattsUp values refresh every second
 #define WU_MIN_INTERVAL_US 1000000
 // we will poll the device 10x faster - data is often available (even if it hasn't changed)
@@ -47,36 +40,10 @@ int energymon_get_default(energymon* em) {
 
 typedef struct energymon_wattsup {
   energymon_wattsup_ctx* ctx;
-
-  int poll;
   pthread_t thread;
-  int use_estimates;
-
-  uint64_t exec_us;
-  uint64_t last_us;
-  unsigned int deciwatts;
-  int lock;
   uint64_t total_uj;
+  int poll;
 } energymon_wattsup;
-
-static void lock_acquire(int* lock) {
-  assert(lock != NULL);
-#if defined(_WIN32)
-  while (InterlockedExchange((long*) lock, 1)) {
-#else
-  while (__sync_lock_test_and_set(lock, 1)) {
-#endif
-    while (*lock);
-  }
-}
-
-static void lock_release(int* lock) {
-#if defined(_WIN32)
-  InterlockedExchange((long*) lock, 0);
-#else
-  __sync_lock_release(lock);
-#endif
-}
 
 // Only for use by the polling thread - enables pthread cancel while sleeping, then disables it
 static int wattsup_thread_sleep_us(uint64_t us, volatile const int* poll) {
@@ -85,7 +52,7 @@ static int wattsup_thread_sleep_us(uint64_t us, volatile const int* poll) {
   if (*poll) {
 #ifndef __ANDROID__
     // Deadlock can occur during disconnect in some wattsup_driver impls if thread is canceled during I/O
-    // Enable thread cancel while sleeping, disable during I/O and when holding locks
+    // Enable thread cancel while sleeping, disable during I/O
     int dummy_old_state;
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &dummy_old_state);
 #endif
@@ -202,25 +169,21 @@ static void* wattsup_poll_sensors(void* args) {
   energymon_wattsup* state = (energymon_wattsup*) args;
   char buf[WU_BUFSIZE] = { 0 };
   char* pstart;
-  state->deciwatts = 0;
-  if (!(state->last_us = energymon_gettime_us())) {
+  uint64_t exec_us;
+  uint64_t last_us;
+  unsigned int deciwatts = 0;
+  if (!(last_us = energymon_gettime_us())) {
     // must be that CLOCK_MONOTONIC is not supported
-    perror("wattsup_poll_sensors");
+    perror("wattsup_poll_sensors: energymon_gettime_us");
     return (void*) NULL;
   }
   wattsup_thread_sleep_us(WU_POLL_INTERVAL_US, &state->poll);
   while (state->poll) {
     if ((pstart = data_packet_read(state->ctx, buf, sizeof(buf), &state->poll))) {
-      data_packet_parse(pstart, &state->deciwatts);
+      data_packet_parse(pstart, &deciwatts);
     }
-    if (state->use_estimates) {
-      lock_acquire(&state->lock);
-    }
-    state->exec_us = energymon_gettime_elapsed_us(&state->last_us);
-    state->total_uj += state->deciwatts * state->exec_us / 10;
-    if (state->use_estimates) {
-      lock_release(&state->lock);
-    }
+    exec_us = energymon_gettime_elapsed_us(&last_us);
+    state->total_uj += deciwatts * exec_us / 10;
     wattsup_thread_sleep_us(WU_POLL_INTERVAL_US, &state->poll);
   }
   return (void*) NULL;
@@ -304,9 +267,6 @@ int energymon_init_wattsup(energymon* em) {
     return -1;
   }
 
-  // set state properties
-  state->use_estimates = getenv(ENERGYMON_WATTSUP_ENABLE_ESTIMATES) != NULL;
-
   // start polling thread
   state->poll = 1;
   err_save = pthread_create(&state->thread, NULL, wattsup_poll_sensors, state);
@@ -360,14 +320,7 @@ uint64_t energymon_read_total_wattsup(const energymon* em) {
     errno = EINVAL;
     return 0;
   }
-  energymon_wattsup* state = (energymon_wattsup*) em->state;
-  if (state->use_estimates) {
-    lock_acquire(&state->lock);
-    state->exec_us = energymon_gettime_elapsed_us(&state->last_us);
-    state->total_uj += state->deciwatts * state->exec_us / 10;
-    lock_release(&state->lock);
-  }
-  return state->total_uj;
+  return ((energymon_wattsup*) em->state)->total_uj;
 }
 
 char* energymon_get_source_wattsup(char* buffer, size_t n) {
